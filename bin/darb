@@ -1,0 +1,151 @@
+#!/usr/bin/env ruby
+
+DARB_VERSION = '0.6'
+
+if ARGV.delete("-v")
+  puts DARB_VERSION
+  exit
+end
+
+if ARGV.empty? || ARGV.delete("-h") || ARGV.delete("--help")
+  puts <<-HELP; exit
+    Usage: darb main.rb feature1 feature2 feature3=path/to/file ... > script.rb
+
+    DARB == DATA-Archived RuBy script.
+
+    Writes a darb archive script to standard out. One argument is
+    required and the rest are optional. There are no options except
+    -h and --help.
+
+    The main.rb code is executed when the archive is executed. Darb
+    simply inserts this code into the archive, after one initial line
+    to set up a customized #require. This main part of the archive can
+    be freely edited after generating the archive. After the __END__
+    line, the archive contains the #require implementation, an offset
+    table, and the library files themselves. Darb makes no effort to
+    separate the embedded files or make them easily extractable
+
+    Each of the features can be #require-d from the main.rb file, and
+    will be loaded as needed from the DATA segment of the archive. As
+    with Kernel#require, feature names are added to $LOADED_FEATURES
+    and only loaded once per feature name. #require falls back to the
+    original Kernel#require if the feature is not found in the archive.
+    Works correctly with autoloading files that are outside (not inside)
+    the archive. Works correctly with nested requires.
+
+    Feature syntax:
+
+      - the .rb is optional
+      
+      - other extensions are permitted, but .so is not supported
+
+      - the 'feature3=path/to/file' argument means that darb should
+        copy the file from the given path into the archive, and load
+        it in response to "require 'feature3'".
+
+    Error messages are reported correctly in terms of the original
+    file and line.
+    
+    Darb works correctly when some or all input files have cr-lf line
+    endings (mswin style) instead of just lf (unix style). Archives
+    generated on mswin run on unix/linux and vice versa. However, if
+    you edit the archive on windows, be sure to save it with lf line
+    endings. In general, don't edit the DATA section. Edit the source
+    files and rerun darb.
+    
+    Darb prepends a hash-bang line to the output if the darb script
+    itself has one (it simply copies the line).
+    
+    Limitations: main.rb cannot have its own DATA section (that is,
+    block of data separated from code by __END__).
+    
+    Side effects: Darb defines the private instance method
+    Kernel#empty_binding, which simply returns a new binding with
+    no local variables.
+    
+    AUTHOR  :    Joel VanderWerf, vjoel@users.sourceforge.net
+    VERSION :    0.5
+    LICENSE :    Ruby license (credit appreciated), with no
+                 restrictions on generated code.
+  HELP
+end
+
+STDOUT.binmode
+
+main = ARGV.shift
+
+offset = 0
+files = []
+file_bodies = []
+
+table_lines = ARGV.map do |feature|
+  if /=/ =~ feature
+    feature, file = feature.split("=").map {|f|f.strip}
+  else
+    feature, file = feature, feature
+  end
+  
+  feature += ".rb" unless /\.\w+$/ =~ feature
+  file += ".rb" unless /\.\w+$/ =~ file
+  file = File.expand_path(file)
+  files << file
+  
+  file_bodies << file_body = File.read(file)
+  len = file_body.length
+  line = %{    "#{feature}" => [#{offset}, #{len}]}
+  offset += len
+  line
+end
+table = table_lines.join(",\n")
+
+hashbang_line = File.open(__FILE__) {|f|f.gets}
+puts hashbang_line if /^#!/ =~ hashbang_line
+puts "DATA.binmode"
+puts %{eval(DATA.inject("") {|s,l| break s if /^__END__$/=~l; s<<l})}
+puts
+puts File.read(main)
+puts "__END__"
+puts <<EOS, file_bodies
+Kernel.module_eval do
+  table = {
+#{table}
+  }
+  start_pos = DATA.pos
+
+  orig_require  = instance_method(:require) # Thanks, batsman!
+  orig_autoload = instance_method(:autoload)
+  
+  def empty_binding
+    binding
+  end
+  private :empty_binding
+
+  define_method(:require) do |feature|
+    darb_feature = feature.dup
+    darb_feature += ".rb" unless /\\.\\w+$/ =~ darb_feature
+    k, (pos,len) = table.find {|k,v|k==darb_feature}
+    if k
+      if $LOADED_FEATURES.include? darb_feature
+        false
+      else
+        DATA.seek start_pos + pos
+        str = DATA.read(len)
+        begin
+          eval str, empty_binding, darb_feature
+        rescue Exception => ex
+          bt = ex.backtrace
+          s = bt.pop until /empty_binding'$/ =~ s
+          bt[-1].slice!(/:in `empty_binding'/)
+          raise ex, ex.message, bt
+        end
+        $LOADED_FEATURES << darb_feature
+        true
+      end
+    else
+      orig_require.bind(self).call(feature)
+    end
+  end
+end
+
+__END__
+EOS
